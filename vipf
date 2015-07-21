@@ -1,0 +1,151 @@
+#!/bin/sh
+#
+# Copyright (c) 2012 Reinier Schoof
+#
+# Adaptation to the failsafe ipfw editing script,
+# written by Alexandre Peixoto and originally shipped with FreeBSD
+#
+# $FreeBSD: release/9.0.0/share/examples/ipfw/change_rules.sh 119833 2003-09-07 07:52:56Z jmg $
+
+# Change pf(4) rules with safety guarantees for remote operation
+#
+# Invoke this script to edit ${pf_rules}. It will call ${EDITOR},
+# or vi(1) if the environment variable is not set, for you to edit
+# ${pf_rules}, ask for confirmation, and then run
+# ${pf_program}. You can then examine the output of pfctl -s rules and
+# confirm whether you want the new version or not.
+#
+# If no answer is received in 30 seconds, the previous
+# ${pf_rules} are applied, restoring the old rules
+#
+# If the new rules are confirmed, they'll replace ${pf_rules} and
+# the previous ones will be copied to ${pf_rules}.{date}. Mail
+# will also be sent to root with a unified diff of the rule change.
+#
+# Unapproved rules are kept in ${pf_rules}.new, and you are
+# offered the option of changing them instead of the present rules when
+# you call this script.
+#
+# After using this script, ${pf_rules} will be flagged immutable,
+# so no changes can be made bypassing this failsafe
+#
+
+# halt on error
+set -e
+
+if [ -r /etc/defaults/rc.conf ]; then
+	. /etc/defaults/rc.conf
+	source_rc_confs
+elif [ -r /etc/rc.conf ]; then
+	. /etc/rc.conf
+fi
+
+EDITOR=${EDITOR:-/usr/bin/vi}
+PAGER=${PAGER:-/usr/bin/less}
+
+get_yes_no() {
+    local a
+	while true
+	do
+		echo -n "$1 (Y/N) ? "
+		read -t 30 a
+		if [ $? != 0 ]; then
+            return 1 # no
+		fi
+		case $a in
+			[Yy]) return;;
+			[Nn]) return 1;;
+			*);;
+		esac
+	done
+}
+
+restore_rules() {
+	nohup ${pf_program} -f ${pf_rules} </dev/null >/dev/null 2>&1
+	exit 1
+}
+
+if [ ! -f ${pf_rules} ] && \
+    ! get_yes_no "Firewall config ${pf_rules} not found, are you sure you want to continue editing it"; then
+    exit 1
+fi
+
+if [ -f ${pf_rules}.new ] && \
+    ! get_yes_no "A new rules file already exists, do you want to use it"; then
+    cp ${pf_rules} ${pf_rules}.new
+elif [ -f ${pf_rules} ]; then
+	cp ${pf_rules} ${pf_rules}.new
+fi
+
+trap restore_rules SIGHUP
+
+${EDITOR} ${pf_rules}.new
+if [ -f ${pf_rules}.new ]; then
+	while ! ${pf_program} -nf ${pf_rules}.new
+	do
+        if ! get_yes_no "Your configuration contains errors, do you want to fix it"; then
+			restore_rules
+			exit 1
+		fi
+
+		${EDITOR} ${pf_rules}.new
+	done
+fi
+
+if cmp -s ${pf_rules} ${pf_rules}.new; then
+	echo "Nothing changed, not applying rules."
+	rm ${pf_rules}.new
+	exit
+fi
+
+if [ ! -s ${pf_rules}.new ]; then
+	echo "Not applying empty rule set"
+	echo "If you want to disable pf, use pfctl -d"
+	rm -f ${pf_rules}.new
+	exit 1
+fi
+
+if ! get_yes_no "Do you want to install the new rules"; then
+    exit 1
+fi
+
+cat <<!
+The rules will be changed now. If the message 'Type y to keep the new
+rules' does not appear on the screen or the y key is not pressed in 30
+seconds, the original rules will be restored.
+The TCP/IP connections might be broken during the change. If so, restore
+the ssh/telnet connection being used.
+!
+
+nohup ${pf_program} -f ${pf_rules}.new </dev/null >/dev/null 2>&1
+
+sleep 2;
+if get_yes_no "Would you like to see the resulting new rules"; then
+    ${pf_program} -s rules | ${PAGER}
+fi
+
+if ! get_yes_no "Type y to keep the new rules"; then
+    restore_rules
+fi
+
+if [ -f ${pf_rules} ]; then
+	DATE=`date "+%Y%m%d%H%M"`
+	cp ${pf_rules} ${pf_rules}.${DATE}
+
+	cat <<!
+The new rules are now installed. The previous rules have been preserved in
+the file ${pf_rules}.${DATE}
+!
+
+	chflags noschg ${pf_rules}
+fi
+
+mv ${pf_rules}.new ${pf_rules} 
+chflags schg ${pf_rules}
+
+if [ -f ${pf_rules}.${DATE} ]; then
+	diff -F "^# .*[A-Za-z]" -u ${pf_rules}.${DATE} ${pf_rules} \
+    	| mail -s "`hostname` Firewall rule change" root
+fi
+
+exit 0
